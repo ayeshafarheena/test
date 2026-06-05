@@ -89,7 +89,6 @@ jobs:
       - name: Create CloudFront distribution
         id: cloudfront
         run: |
-          # AWS returns null (not []) when no distributions exist
           EXISTING=$(aws cloudfront list-distributions \
             --query "DistributionList.Items[?Comment=='$CF_COMMENT'].{id:Id,domain:DomainName}" \
             --output json)
@@ -190,7 +189,8 @@ jobs:
             echo "EC2 already running: $EXISTING"
             echo "instance_id=$EXISTING" >> "$GITHUB_OUTPUT"
           else
-            USER_DATA=$(echo "IyEvYmluL2Jhc2gKc2V0IC1lCnl1bSB1cGRhdGUgLXkKeXVtIGluc3RhbGwgLXkgcHl0aG9uMyBweXRob24zLXBpcCBnaXQgYW1hem9uLXNzbS1hZ2VudApzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQKc3lzdGVtY3RsIHN0YXJ0IGFtYXpvbi1zc20tYWdlbnQKbWtkaXIgLXAgL2FwcApwaXAzIGluc3RhbGwgZmFzdGFwaSAidXZpY29ybltzdGFuZGFyZF0iIGJvdG8zIHB5dGhvbi1tdWx0aXBhcnQ=")
+            # FIX: use python3 -m pip instead of pip3 (AL2023 does not symlink pip3)
+            USER_DATA=$(echo "IyEvYmluL2Jhc2gKc2V0IC1lCnl1bSB1cGRhdGUgLXkKeXVtIGluc3RhbGwgLXkgcHl0aG9uMyBweXRob24zLXBpcCBnaXQgYW1hem9uLXNzbS1hZ2VudApzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQKc3lzdGVtY3RsIHN0YXJ0IGFtYXpvbi1zc20tYWdlbnQKbWtkaXIgLXAgL2FwcApweXRob24zIC1tIHBpcCBpbnN0YWxsIGZhc3RhcGkgInV2aWNvcm5bc3RhbmRhcmRdIiBib3RvMyBweXRob24tbXVsdGlwYXJ0Cg==")
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id            "${{ steps.ami.outputs.ami_id }}" \
               --instance-type       t2.medium \
@@ -255,7 +255,8 @@ jobs:
             'aws s3 cp s3://' + b + '/deploy/main.py /app/main.py',
             'aws s3 cp s3://' + b + '/deploy/requirements.txt /app/requirements.txt',
             'aws s3 cp s3://' + b + '/deploy/movies-backend.service /etc/systemd/system/movies-backend.service',
-            'pip3 install -q -r /app/requirements.txt',
+            # FIX: use python3 -m pip — AL2023 does not create a pip3 symlink
+            'python3 -m pip install -q -r /app/requirements.txt',
             'printf \"S3_UPLOAD_BUCKET=' + b + '\nAWS_REGION=' + r + '\nCLOUDFRONT_DOMAIN=' + c + '\n\" > /etc/movies-backend.env',
             'chmod 600 /etc/movies-backend.env',
             'grep -q EnvironmentFile /etc/systemd/system/movies-backend.service || sed -i \"/\[Service\]/a EnvironmentFile=/etc/movies-backend.env\" /etc/systemd/system/movies-backend.service',
@@ -334,12 +335,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         working-directory: frontend
-        run: npm ci
+        # FIX: use npm install — no package-lock.json committed so npm ci would fail
+        run: npm install
 
       - name: Build React app
         working-directory: frontend
