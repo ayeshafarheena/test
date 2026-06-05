@@ -107,19 +107,21 @@ jobs:
                 '{"Name":"movies-app-oac","Description":"CineStream OAC","SigningProtocol":"sigv4","SigningBehavior":"always","OriginAccessControlOriginType":"s3"}' \
                 --query "OriginAccessControl.Id" --output text)
             fi
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
             RESULT=$(aws cloudfront create-distribution --distribution-config "{
               \"CallerReference\": \"movies-$(date +%s)\",
               \"Comment\": \"$CF_COMMENT\",
+              \"DefaultRootObject\": \"index.html\",
               \"DefaultCacheBehavior\": {
-                \"TargetOriginId\": \"s3-origin\",
+                \"TargetOriginId\": \"s3-static-origin\",
                 \"ViewerProtocolPolicy\": \"redirect-to-https\",
                 \"CachePolicyId\": \"658327ea-f89d-4fab-a63d-7e88639e58f6\",
                 \"AllowedMethods\": {\"Quantity\":2,\"Items\":[\"GET\",\"HEAD\"]},
                 \"Compress\": true
               },
               \"Origins\": {\"Quantity\":1,\"Items\":[{
-                \"Id\": \"s3-origin\",
-                \"DomainName\": \"${S3_UPLOAD_BUCKET}.s3.${AWS_REGION}.amazonaws.com\",
+                \"Id\": \"s3-static-origin\",
+                \"DomainName\": \"${S3_STATIC_BUCKET}.s3.${AWS_REGION}.amazonaws.com\",
                 \"OriginAccessControlId\": \"$OAC_ID\",
                 \"S3OriginConfig\": {\"OriginAccessIdentity\": \"\"}
               }]},
@@ -129,14 +131,14 @@ jobs:
             }")
             DOMAIN=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['DomainName'])")
             ID=$(echo "$RESULT"     | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['Id'])")
-            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-            aws s3api put-bucket-policy --bucket "$S3_UPLOAD_BUCKET" --policy "{
+            # FIX: grant CloudFront OAC access to the STATIC bucket (not upload bucket)
+            aws s3api put-bucket-policy --bucket "$S3_STATIC_BUCKET" --policy "{
               \"Version\":\"2012-10-17\",
               \"Statement\":[{
                 \"Effect\":\"Allow\",
                 \"Principal\":{\"Service\":\"cloudfront.amazonaws.com\"},
                 \"Action\":\"s3:GetObject\",
-                \"Resource\":\"arn:aws:s3:::${S3_UPLOAD_BUCKET}/*\",
+                \"Resource\":\"arn:aws:s3:::${S3_STATIC_BUCKET}/*\",
                 \"Condition\":{\"StringEquals\":{\"AWS:SourceArn\":\"arn:aws:cloudfront::${ACCOUNT_ID}:distribution/${ID}\"}}
               }]
             }"
@@ -189,7 +191,6 @@ jobs:
             echo "EC2 already running: $EXISTING"
             echo "instance_id=$EXISTING" >> "$GITHUB_OUTPUT"
           else
-            # FIX: use python3 -m pip instead of pip3 (AL2023 does not symlink pip3)
             USER_DATA=$(echo "IyEvYmluL2Jhc2gKc2V0IC1lCnl1bSB1cGRhdGUgLXkKeXVtIGluc3RhbGwgLXkgcHl0aG9uMyBweXRob24zLXBpcCBnaXQgYW1hem9uLXNzbS1hZ2VudApzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQKc3lzdGVtY3RsIHN0YXJ0IGFtYXpvbi1zc20tYWdlbnQKbWtkaXIgLXAgL2FwcApweXRob24zIC1tIHBpcCBpbnN0YWxsIGZhc3RhcGkgInV2aWNvcm5bc3RhbmRhcmRdIiBib3RvMyBweXRob24tbXVsdGlwYXJ0Cg==")
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id            "${{ steps.ami.outputs.ami_id }}" \
@@ -255,7 +256,6 @@ jobs:
             'aws s3 cp s3://' + b + '/deploy/main.py /app/main.py',
             'aws s3 cp s3://' + b + '/deploy/requirements.txt /app/requirements.txt',
             'aws s3 cp s3://' + b + '/deploy/movies-backend.service /etc/systemd/system/movies-backend.service',
-            # FIX: use python3 -m pip — AL2023 does not create a pip3 symlink
             'python3 -m pip install -q -r /app/requirements.txt',
             'printf \"S3_UPLOAD_BUCKET=' + b + '\nAWS_REGION=' + r + '\nCLOUDFRONT_DOMAIN=' + c + '\n\" > /etc/movies-backend.env',
             'chmod 600 /etc/movies-backend.env',
@@ -338,7 +338,6 @@ jobs:
 
       - name: Install dependencies
         working-directory: frontend
-        # FIX: use npm install — no package-lock.json committed so npm ci would fail
         run: npm install
 
       - name: Build React app
@@ -411,6 +410,7 @@ jobs:
             echo "|---------|-----|"
             echo "| Backend API | http://${IP}:8000 |"
             echo "| API Docs    | http://${IP}:8000/docs |"
+            echo "| Frontend    | https://${CF} |"
             echo "| Video CDN   | https://${CF}/videos/<key> |"
             echo ""
             echo "| Job | Result |"
