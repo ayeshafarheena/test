@@ -1,0 +1,421 @@
+name: CineStream Full Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION:         us-east-1
+  S3_UPLOAD_BUCKET:   movies-app-upload-raw-videos
+  S3_STATIC_BUCKET:   movies-app-static-frontend
+  EC2_INSTANCE_NAME:  movies-backend
+  CF_COMMENT:         movies-app-cdn
+  SG_NAME:            movies-backend-sg
+  IAM_ROLE_NAME:      movies-backend-ec2-role
+  IAM_PROFILE_NAME:   movies-backend-ec2-profile
+
+jobs:
+
+  # ───────────────────────────────────────────────────────
+  # JOB 1 — Provision AWS infrastructure (idempotent)
+  # ───────────────────────────────────────────────────────
+  provision-infrastructure:
+    name: Provision AWS Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      upload_bucket:     ${{ steps.buckets.outputs.upload_bucket }}
+      static_bucket:     ${{ steps.buckets.outputs.static_bucket }}
+      cloudfront_domain: ${{ steps.cloudfront.outputs.domain }}
+      cloudfront_id:     ${{ steps.cloudfront.outputs.id }}
+      ec2_instance_id:   ${{ steps.ec2.outputs.instance_id }}
+      ec2_public_ip:     ${{ steps.ec2_ip.outputs.public_ip }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Create S3 buckets
+        id: buckets
+        run: |
+          create_bucket() {
+            local B=$1
+            if aws s3api head-bucket --bucket "$B" 2>/dev/null; then
+              echo "Bucket $B already exists"
+            else
+              aws s3api create-bucket --bucket "$B" --region "$AWS_REGION"
+              aws s3api put-public-access-block --bucket "$B" \
+                --public-access-block-configuration \
+                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+              aws s3api put-bucket-encryption --bucket "$B" \
+                --server-side-encryption-configuration \
+                '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+              aws s3api put-bucket-versioning --bucket "$B" \
+                --versioning-configuration Status=Enabled
+              echo "Created bucket $B"
+            fi
+          }
+          create_bucket "$S3_UPLOAD_BUCKET"
+          create_bucket "$S3_STATIC_BUCKET"
+          aws s3api put-bucket-cors --bucket "$S3_UPLOAD_BUCKET" \
+            --cors-configuration \
+            '{"CORSRules":[{"AllowedHeaders":["*"],"AllowedMethods":["GET","PUT","POST","DELETE","HEAD"],"AllowedOrigins":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3000}]}'
+          echo "upload_bucket=$S3_UPLOAD_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "static_bucket=$S3_STATIC_BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Create IAM role for EC2
+        run: |
+          TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+          aws iam get-role --role-name "$IAM_ROLE_NAME" 2>/dev/null || \
+            aws iam create-role --role-name "$IAM_ROLE_NAME" \
+              --assume-role-policy-document "$TRUST" \
+              --description "CineStream EC2 role"
+          aws iam attach-role-policy --role-name "$IAM_ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess 2>/dev/null || true
+          aws iam attach-role-policy --role-name "$IAM_ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
+          if ! aws iam get-instance-profile --instance-profile-name "$IAM_PROFILE_NAME" 2>/dev/null; then
+            aws iam create-instance-profile --instance-profile-name "$IAM_PROFILE_NAME"
+            aws iam add-role-to-instance-profile \
+              --instance-profile-name "$IAM_PROFILE_NAME" \
+              --role-name "$IAM_ROLE_NAME"
+            sleep 10
+          fi
+
+      - name: Create CloudFront distribution
+        id: cloudfront
+        run: |
+          EXISTING=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='$CF_COMMENT'].{id:Id,domain:DomainName}" \
+            --output json)
+          COUNT=$(echo "$EXISTING" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+          if [ "$COUNT" -gt "0" ]; then
+            DOMAIN=$(echo "$EXISTING" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['domain'])")
+            ID=$(echo "$EXISTING"     | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+            echo "CloudFront exists: $DOMAIN"
+          else
+            OAC_ID=$(aws cloudfront list-origin-access-controls \
+              --query "OriginAccessControlList.Items[?Name=='movies-app-oac'].Id" \
+              --output text)
+            if [ -z "$OAC_ID" ] || [ "$OAC_ID" = "None" ]; then
+              OAC_ID=$(aws cloudfront create-origin-access-control \
+                --origin-access-control-config \
+                '{"Name":"movies-app-oac","Description":"CineStream OAC","SigningProtocol":"sigv4","SigningBehavior":"always","OriginAccessControlOriginType":"s3"}' \
+                --query "OriginAccessControl.Id" --output text)
+            fi
+            RESULT=$(aws cloudfront create-distribution --distribution-config "{
+              \"CallerReference\": \"movies-$(date +%s)\",
+              \"Comment\": \"$CF_COMMENT\",
+              \"DefaultCacheBehavior\": {
+                \"TargetOriginId\": \"s3-origin\",
+                \"ViewerProtocolPolicy\": \"redirect-to-https\",
+                \"CachePolicyId\": \"658327ea-f89d-4fab-a63d-7e88639e58f6\",
+                \"AllowedMethods\": {\"Quantity\":2,\"Items\":[\"GET\",\"HEAD\"]},
+                \"Compress\": true
+              },
+              \"Origins\": {\"Quantity\":1,\"Items\":[{
+                \"Id\": \"s3-origin\",
+                \"DomainName\": \"${S3_UPLOAD_BUCKET}.s3.${AWS_REGION}.amazonaws.com\",
+                \"OriginAccessControlId\": \"$OAC_ID\",
+                \"S3OriginConfig\": {\"OriginAccessIdentity\": \"\"}
+              }]},
+              \"Enabled\": true,
+              \"HttpVersion\": \"http2\",
+              \"PriceClass\": \"PriceClass_100\"
+            }")
+            DOMAIN=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['DomainName'])")
+            ID=$(echo "$RESULT"     | python3 -c "import sys,json; print(json.load(sys.stdin)['Distribution']['Id'])")
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            aws s3api put-bucket-policy --bucket "$S3_UPLOAD_BUCKET" --policy "{
+              \"Version\":\"2012-10-17\",
+              \"Statement\":[{
+                \"Effect\":\"Allow\",
+                \"Principal\":{\"Service\":\"cloudfront.amazonaws.com\"},
+                \"Action\":\"s3:GetObject\",
+                \"Resource\":\"arn:aws:s3:::${S3_UPLOAD_BUCKET}/*\",
+                \"Condition\":{\"StringEquals\":{\"AWS:SourceArn\":\"arn:aws:cloudfront::${ACCOUNT_ID}:distribution/${ID}\"}}
+              }]
+            }"
+            echo "Created CloudFront: $DOMAIN"
+          fi
+          echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "id=$ID"         >> "$GITHUB_OUTPUT"
+
+      - name: Create security group
+        id: sg
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" --output text)
+          EXISTING=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$SG_NAME" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "sg_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "CineStream backend" \
+              --vpc-id "$VPC_ID" \
+              --query "GroupId" --output text)
+            for PORT in 22 80 443 8000; do
+              aws ec2 authorize-security-group-ingress \
+                --group-id "$SG_ID" --protocol tcp --port "$PORT" --cidr 0.0.0.0/0
+            done
+            aws ec2 create-tags --resources "$SG_ID" \
+              --tags Key=Name,Value="$SG_NAME" Key=App,Value=cinestream
+            echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get latest Amazon Linux 2023 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ssm get-parameter \
+            --name "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" \
+            --query "Parameter.Value" --output text)
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          EXISTING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$EC2_INSTANCE_NAME" \
+              "Name=instance-state-name,Values=running,pending" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "EC2 already running: $EXISTING"
+            echo "instance_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            USER_DATA=$(echo "IyEvYmluL2Jhc2gKc2V0IC1lCnl1bSB1cGRhdGUgLXkKeXVtIGluc3RhbGwgLXkgcHl0aG9uMyBweXRob24zLXBpcCBnaXQgYW1hem9uLXNzbS1hZ2VudApzeXN0ZW1jdGwgZW5hYmxlIGFtYXpvbi1zc20tYWdlbnQKc3lzdGVtY3RsIHN0YXJ0IGFtYXpvbi1zc20tYWdlbnQKbWtkaXIgLXAgL2FwcApwaXAzIGluc3RhbGwgZmFzdGFwaSAidXZpY29ybltzdGFuZGFyZF0iIGJvdG8zIHB5dGhvbi1tdWx0aXBhcnQ=")
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id            "${{ steps.ami.outputs.ami_id }}" \
+              --instance-type       t2.medium \
+              --security-group-ids  "${{ steps.sg.outputs.sg_id }}" \
+              --iam-instance-profile Name="$IAM_PROFILE_NAME" \
+              --user-data           "$USER_DATA" \
+              --metadata-options    "HttpTokens=required,HttpEndpoint=enabled" \
+              --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true,"Encrypted":true}}]' \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=movies-backend},{Key=App,Value=cinestream},{Key=ManagedBy,Value=github-actions}]" \
+              --query "Instances[0].InstanceId" --output text)
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for EC2 running
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+
+      - name: Get EC2 public IP
+        id: ec2_ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────
+  # JOB 2 — Deploy Python backend via SSM (no SSH needed)
+  # ───────────────────────────────────────────────────────
+  deploy-backend:
+    name: Deploy Python Backend
+    runs-on: ubuntu-latest
+    needs: provision-infrastructure
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Stage backend files in S3
+        run: |
+          aws s3 cp backend/main.py               s3://${{ env.S3_UPLOAD_BUCKET }}/deploy/main.py
+          aws s3 cp backend/requirements.txt       s3://${{ env.S3_UPLOAD_BUCKET }}/deploy/requirements.txt
+          aws s3 cp backend/movies-backend.service s3://${{ env.S3_UPLOAD_BUCKET }}/deploy/movies-backend.service
+
+      - name: Generate deploy script and stage in S3
+        run: |
+          BUCKET="${{ env.S3_UPLOAD_BUCKET }}"
+          REGION="${{ env.AWS_REGION }}"
+          CF_DOMAIN="${{ needs.provision-infrastructure.outputs.cloudfront_domain }}"
+          python3 -c "
+          b='$BUCKET'; r='$REGION'; c='$CF_DOMAIN'
+          script = [
+            '#!/bin/bash',
+            'set -e',
+            'aws s3 cp s3://' + b + '/deploy/main.py /app/main.py',
+            'aws s3 cp s3://' + b + '/deploy/requirements.txt /app/requirements.txt',
+            'aws s3 cp s3://' + b + '/deploy/movies-backend.service /etc/systemd/system/movies-backend.service',
+            'pip3 install -q -r /app/requirements.txt',
+            'printf \"S3_UPLOAD_BUCKET=' + b + '\nAWS_REGION=' + r + '\nCLOUDFRONT_DOMAIN=' + c + '\n\" > /etc/movies-backend.env',
+            'chmod 600 /etc/movies-backend.env',
+            'grep -q EnvironmentFile /etc/systemd/system/movies-backend.service || sed -i \"/\[Service\]/a EnvironmentFile=/etc/movies-backend.env\" /etc/systemd/system/movies-backend.service',
+            'sed -i \"s|ExecStart=.*|ExecStart=/usr/local/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2|\" /etc/systemd/system/movies-backend.service',
+            'systemctl daemon-reload',
+            'systemctl enable movies-backend',
+            'systemctl restart movies-backend',
+            'sleep 3',
+            'systemctl is-active movies-backend && echo ok || (journalctl -u movies-backend -n 30; exit 1)',
+          ]
+          open('/tmp/deploy.sh','w').write('\n'.join(script))
+          "
+          aws s3 cp /tmp/deploy.sh s3://$BUCKET/deploy/deploy.sh
+
+      - name: Wait for SSM agent to be online
+        run: |
+          INSTANCE_ID="${{ needs.provision-infrastructure.outputs.ec2_instance_id }}"
+          for i in $(seq 1 24); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || echo "None")
+            echo "attempt $i/24 -> $STATUS"
+            [ "$STATUS" = "Online" ] && echo "SSM online" && break
+            sleep 15
+          done
+          [ "$STATUS" = "Online" ] || (echo "SSM agent not online" && exit 1)
+
+      - name: Run deploy script on EC2 via SSM
+        id: ssm_deploy
+        run: |
+          BUCKET="${{ env.S3_UPLOAD_BUCKET }}"
+          INSTANCE_ID="${{ needs.provision-infrastructure.outputs.ec2_instance_id }}"
+          CMD="aws s3 cp s3://$BUCKET/deploy/deploy.sh /tmp/deploy.sh && bash /tmp/deploy.sh"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "CineStream deploy" \
+            --parameters commands=["$CMD"] \
+            --query "Command.CommandId" --output text)
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSM command to finish
+        run: |
+          INSTANCE_ID="${{ needs.provision-infrastructure.outputs.ec2_instance_id }}"
+          CMD_ID="${{ steps.ssm_deploy.outputs.command_id }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "attempt $i/30 -> $STATUS"
+            [ "$STATUS" = "Success" ] && echo "Deploy succeeded" && break
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              aws ssm get-command-invocation \
+                --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                --query "{out:StandardOutputContent,err:StandardErrorContent}" --output text
+              exit 1
+            fi
+            sleep 10
+          done
+
+  # ───────────────────────────────────────────────────────
+  # JOB 3 — Build React and deploy to S3 + CloudFront
+  # ───────────────────────────────────────────────────────
+  deploy-frontend:
+    name: Build and Deploy React Frontend
+    runs-on: ubuntu-latest
+    needs: [provision-infrastructure, deploy-backend]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build React app
+        working-directory: frontend
+        env:
+          REACT_APP_API_URL: http://${{ needs.provision-infrastructure.outputs.ec2_public_ip }}:8000
+          REACT_APP_CDN_URL: https://${{ needs.provision-infrastructure.outputs.cloudfront_domain }}
+          GENERATE_SOURCEMAP: 'false'
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Sync build to S3
+        run: |
+          aws s3 sync frontend/build/ s3://${{ env.S3_STATIC_BUCKET }}/ \
+            --delete \
+            --exclude "index.html" \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp frontend/build/index.html s3://${{ env.S3_STATIC_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ needs.provision-infrastructure.outputs.cloudfront_id }}" \
+            --paths "/*"
+
+  # ───────────────────────────────────────────────────────
+  # JOB 4 — Smoke test
+  # ───────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [provision-infrastructure, deploy-backend, deploy-frontend]
+    if: success()
+
+    steps:
+      - name: Health check backend
+        run: |
+          IP="${{ needs.provision-infrastructure.outputs.ec2_public_ip }}"
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${IP}:8000/" 2>/dev/null || echo "000")
+            echo "attempt $i -> HTTP $STATUS"
+            [ "$STATUS" = "200" ] && echo "Backend healthy" && break
+            sleep 10
+          done
+
+  # ───────────────────────────────────────────────────────
+  # JOB 5 — Summary (always runs)
+  # ───────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [provision-infrastructure, deploy-backend, deploy-frontend, smoke-test]
+    if: always()
+
+    steps:
+      - name: Write summary
+        run: |
+          CF="${{ needs.provision-infrastructure.outputs.cloudfront_domain }}"
+          IP="${{ needs.provision-infrastructure.outputs.ec2_public_ip }}"
+          {
+            echo "## CineStream Deployment"
+            echo "| Service | URL |"
+            echo "|---------|-----|"
+            echo "| Backend API | http://${IP}:8000 |"
+            echo "| API Docs    | http://${IP}:8000/docs |"
+            echo "| Video CDN   | https://${CF}/videos/<key> |"
+            echo ""
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            echo "| Provision | ${{ needs.provision-infrastructure.result }} |"
+            echo "| Backend   | ${{ needs.deploy-backend.result }} |"
+            echo "| Frontend  | ${{ needs.deploy-frontend.result }} |"
+            echo "| Smoke     | ${{ needs.smoke-test.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
